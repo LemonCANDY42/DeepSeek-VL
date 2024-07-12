@@ -46,7 +46,10 @@ from deepseek_vl.utils.conversation import SeparatorStyle
 
 def load_models():
     models = {
-        "DeepSeek-VL 7B": "deepseek-ai/deepseek-vl-7b-chat",
+        # "DeepSeek-VL 7B": "deepseek-ai/deepseek-vl-7b-chat",
+        # "DeepSeek-VL 1.3B": "deepseek-ai/deepseek-vl-1.3b-chat",
+        #"DeepSeek-VL 1.3B": "/home/pveubuntu/huggingface/deepseek-vl-1.3b-chat",
+        "DeepSeek-VL 7B": "/mnt/scsi_disk/deepseek-vl-7b-chat",
     }
 
     for model_name in models:
@@ -506,7 +509,7 @@ if __name__ == "__main__":
 
     reload_javascript()
     demo.queue(concurrency_count=CONCURRENT_COUNT).launch(
-        share=False,
+        share=True,
         favicon_path="deepseek_vl/serve/assets/favicon.ico",
         inbrowser=False,
         server_name="0.0.0.0",
