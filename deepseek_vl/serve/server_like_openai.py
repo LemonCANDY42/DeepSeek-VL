@@ -13,6 +13,11 @@ from deepseek_vl.utils.conversation import SeparatorStyle
 
 app = Flask(__name__)
 
+# 全局字典，用于存储每个 IP 地址的对话历史
+conversation_history = {}
+# 用于存储图像数据
+image_storage = {}
+
 # Load models
 def load_models():
     models = {
@@ -23,8 +28,33 @@ def load_models():
     return models
 
 models = load_models()
+"""
+    system_prompt = (
+        "You are a helpful language and vision assistant. "
+        "You are able to understand the visual content that the user provides, "
+        "and assist the user with a variety of tasks using natural language."
+    )
+"""
+DEFAULT_SYSTEM_PROMPT = (
+        "你是语言和视觉方面的得力助手。"
+        "你能理解用户提供的视觉内容"
+        "并用自然语言协助用户完成实时的构图指导，并用中文回复"
+    )
 
-def generate_prompt_with_history(text, image, history, vl_chat_processor, tokenizer, max_length=2048):
+RE_TAKE_PHOTO_SYSTEM_PROMPT = (
+        "你是语言和视觉方面的得力助手。"
+        "你能理解用户提供的视觉内容"
+        "并用自然语言协助用户实时的构图指导，并用中文回复"
+        "你可以关注到之前提到的建议和图像，如果用户新的图像有所改善，适当切稍微的鼓励和提高审美评分"
+    )
+
+
+"""
+    你作为一个摄影审美和构图的专家，会按照0-10的分数给我提供的正在实时拍摄的图片进行实事求是且合理的审美评分（0：极差，3：较差，5：一般，7：较好，9：优秀）。请从以下几个维度进行综合评价：
+    构图、光线、色彩、清晰度、情感表达。并根据画面的好坏给出具体的构图建议（如：移除某元素，将画面向某处移动，改变拍摄角度等）。建议需具体且可操作，字数不超过150字。格式如下：\n审美评分:53\n构图建议:\nxxxx
+"""
+
+def generate_prompt_with_history(text, image, history, vl_chat_processor, tokenizer, max_length=2048, image_counter=1):
     sft_format = "deepseek"
     user_role_ind = 0
     bot_role_ind = 1
@@ -32,12 +62,18 @@ def generate_prompt_with_history(text, image, history, vl_chat_processor, tokeni
     conversation = vl_chat_processor.new_chat_template()
 
     if history:
-        conversation.messages = history
+        # 替换历史记录中的图像数据为带有顺序编号的占位符
+        for role, message in history:
+            if isinstance(message, tuple) and message[1].startswith("<image_placeholder"):
+                conversation.append_message(role, (message[0], f"<image_placeholder_{image_counter}>"))
+                image_counter += 1
+            else:
+                conversation.append_message(role, message)
 
     if image is not None:
         if "<image_placeholder>" not in text:
-            text = "<image_placeholder>" + "\n" + text
-        text = (text, image)
+            text = f"<image_placeholder_{image_counter}>" + "\n" + text
+        text = (text, image)  # 使用实际图像数据
 
     conversation.append_message(conversation.roles[user_role_ind], text)
     conversation.append_message(conversation.roles[bot_role_ind], "")
@@ -64,6 +100,7 @@ def generate_prompt_with_history(text, image, history, vl_chat_processor, tokeni
 
     return None
 
+
 def get_prompt(conv) -> str:
     system_prompt = conv.system_template.format(system_message=conv.system_message)
     if conv.sep_style == SeparatorStyle.DeepSeek:
@@ -82,9 +119,15 @@ def get_prompt(conv) -> str:
         return ret
     else:
         return conv.get_prompt
+    
+def correct_base64_padding(base64_str):
+    return base64_str + '=' * (-len(base64_str) % 4)
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    image_counter = 1
+    
     data = request.json
     text = data.get('text')
     image_data = data.get('image')
@@ -95,9 +138,37 @@ def chat():
     repetition_penalty = data.get('repetition_penalty', 1.1)
     max_length_tokens = data.get('max_length_tokens', 2048)
     max_context_length_tokens = data.get('max_context_length_tokens', 4096)
+    
+    # 获取用户的 IP 地址
+    user_ip = request.remote_addr
+
+    # 获取或创建该 IP 地址的对话历史
+    if user_ip not in conversation_history:
+        conversation_history[user_ip] = {'history': [], 'image_counter': 1}
+
+    # 当前对话历史
+    current_history = conversation_history[user_ip]
+
 
     if image_data:
-        image = Image.open(BytesIO(base64.b64decode(image_data)))
+        # Remove the data URL prefix if it exists
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',', 1)[1]
+        image_data = correct_base64_padding(image_data)
+        try:
+            decoded_image_data = base64.b64decode(image_data)
+            image = Image.open(BytesIO(decoded_image_data))
+            
+            # Convert RGBA (4 channels) to RGB (3 channels)
+            if image.mode == 'RGBA':
+                image = image.convert('RGB')
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
+                
+        except (base64.binascii.Error, PIL.UnidentifiedImageError) as e:
+            print(f"Error decoding image: {e}")
+            print(f"Base64 data (first 100 chars): {image_data[:100]}")
+            return jsonify({'error': 'Invalid image data'}), 400
     else:
         image = None
 
@@ -105,14 +176,16 @@ def chat():
         tokenizer, vl_gpt, vl_chat_processor = models[model_name]
     except KeyError:
         return jsonify({'error': 'Model not found'}), 400
-
+    
+    
     conversation = generate_prompt_with_history(
         text,
         image,
-        history,
+        current_history,  # 使用当前用户的对话历史
         vl_chat_processor,
         tokenizer,
         max_length=max_context_length_tokens,
+        image_counter=image_counter
     )
     if conversation is None:
         return jsonify({'error': 'Failed to generate prompt with history'}), 400
@@ -137,16 +210,30 @@ def chat():
 
     response = full_response.strip()
     conversation.update_last_message(response)
+    
+    conversation.set_system_message(RE_TAKE_PHOTO_SYSTEM_PROMPT)
+    
+    # 更新对话历史，排除不可序列化的对象
+    serializable_messages = []
+    for role, message in conversation.messages:
+        if isinstance(message, tuple) and isinstance(message[1], Image.Image):
+            serializable_messages.append((role, (message[0], f"<image_placeholder_{image_counter}>")))
+            image_counter += 1
+        else:
+            serializable_messages.append((role, message))
+
+    conversation_history[user_ip]['history'] = serializable_messages
+    conversation_history[user_ip]['image_counter'] = image_counter
 
     return jsonify({
         'response': response,
-        'history': conversation.messages
+        'history': conversation_history[user_ip]
     })
 
 @app.route('/chat_no_history', methods=['POST'])
 def chat_no_history():
     data = request.json
-    text = data.get('text')
+    user_text = data.get('text')
     image_data = data.get('image')
     model_name = data.get('model', 'DeepSeek-VL 7B')
     top_p = data.get('top_p', 0.95)
@@ -154,8 +241,28 @@ def chat_no_history():
     repetition_penalty = data.get('repetition_penalty', 1.1)
     max_length_tokens = data.get('max_length_tokens', 2048)
 
+    # Add default system prompt
+    system_text = DEFAULT_SYSTEM_PROMPT
+
     if image_data:
-        image = Image.open(BytesIO(base64.b64decode(image_data)))
+        # Remove the data URL prefix if it exists
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',', 1)[1]
+        image_data = correct_base64_padding(image_data)
+        try:
+            decoded_image_data = base64.b64decode(image_data)
+            image = Image.open(BytesIO(decoded_image_data))
+            
+            # Convert RGBA (4 channels) to RGB (3 channels)
+            if image.mode == 'RGBA':
+                image = image.convert('RGB')
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
+                
+        except (base64.binascii.Error, PIL.UnidentifiedImageError) as e:
+            print(f"Error decoding image: {e}")
+            print(f"Base64 data (first 100 chars): {image_data[:100]}")
+            return jsonify({'error': 'Invalid image data'}), 400
     else:
         image = None
 
@@ -166,11 +273,13 @@ def chat_no_history():
 
     conversation = vl_chat_processor.new_chat_template()
     if image is not None:
-        if "<image_placeholder>" not in text:
-            text = "<image_placeholder>" + "\n" + text
-        text = (text, image)
+        if "<image_placeholder>" not in user_text:
+            user_text = "<image_placeholder>" + "\n" + user_text
+        user_text = (user_text, image)
+        
+    conversation.set_system_message(DEFAULT_SYSTEM_PROMPT)
 
-    conversation.append_message(conversation.roles[0], text)
+    conversation.append_message(conversation.roles[1], user_text)
     conversation.append_message(conversation.roles[1], "")
 
     prompts = convert_conversation_to_prompts(conversation)
@@ -193,10 +302,27 @@ def chat_no_history():
 
     response = full_response.strip()
     conversation.update_last_message(response)
+    
+    print(f"")
 
     return jsonify({
         'response': response
     })
 
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8222)
+
+"""
+    curl -X POST http://localhost:8222/chat_no_history \
+        -H "Content-Type: application/json" \
+        -d '{
+            "text": "This is a system prompt\nWhat is this image about?",
+            "image": "<BASE64_IMAGE_STRING>",
+            "model": "DeepSeek-VL 7B",
+            "top_p": 0.95,
+            "temperature": 0.1,
+            "repetition_penalty": 1.1,
+            "max_length_tokens": 2048
+        }'
+"""

@@ -57,10 +57,15 @@ def convert_conversation_to_prompts(conversation: Conversation):
             ),
             "images": [messages[i][1][1]] if isinstance(messages[i][1], tuple) else [],
         }
-        response = {"role": messages[i + 1][0], "content": messages[i + 1][1]}
-        prompts.extend([prompt, response])
+        prompts.append(prompt)
+
+        # Check if the next message exists before accessing it
+        if i + 1 < len(messages):
+            response = {"role": messages[i + 1][0], "content": messages[i + 1][1]}
+            prompts.append(response)
 
     return prompts
+
 
 
 class StoppingCriteriaSub(StoppingCriteria):
